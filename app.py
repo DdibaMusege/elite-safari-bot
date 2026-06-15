@@ -4,7 +4,7 @@ import os
 from datetime import datetime, timedelta
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from langdetect import detect
+from langdetect import detect, LangDetectException
 from openai import OpenAI
 
 app = Flask(__name__)
@@ -41,17 +41,17 @@ BUSINESSES = {
 }
 
 # Google Sheets
+sheet = None
 try:
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
     client = gspread.authorize(creds)
-    sheet = client.open("Elite_Safari_DB").sheet1
+    # FIX: Use worksheet() method instead of sheet1
+    sheet = client.open("Elite_Safari_DB").worksheet(0)
 except FileNotFoundError:
     print("WARNING: credentials.json not found. Google Sheets integration disabled.")
-    sheet = None
 except Exception as e:
     print(f"ERROR: Failed to connect to Google Sheets: {e}")
-    sheet = None
 
 # ========== AI IMAGE GENERATOR ==========
 def generate_safari_image(prompt, phone):
@@ -77,22 +77,26 @@ def admin_dashboard():
     if not sheet:
         return "Google Sheets not configured", 503
     
-    records = sheet.get_all_records()
-    html = """
-    <html><head><title>Elite Safari Bot Admin</title>
-    <style>body{font-family:Arial;padding:20px} table{border-collapse:collapse;width:100%}
-    th,td{border:1px solid #ddd;padding:8px;text-align:left} th{background:#FF6B35;color:white}</style>
-    </head><body>
-    <h2>Elite Safari Bot - Live Dashboard</h2>
-    <p>Total Leads: {{total}} | Paid: {{paid}} | Trips This Week: {{trips}}</p>
-    <table><tr><th>Phone</th><th>Trip</th><th>Dates</th><th>Pax</th><th>Status</th><th>Payment</th></tr>
-    {% for r in records %}
-    <tr><td>{{r.phone}}</td><td>{{r.trip_type}}</td><td>{{r.dates}}</td><td>{{r.pax}}</td><td>{{r.trip_status}}</td><td>{{r.payment_status}}</td></tr>
-    {% endfor %}</table></body></html>
-    """
-    paid = len([r for r in records if r.get('payment_status') == 'PAID'])
-    trips = len([r for r in records if r.get('trip_status') == 'Confirmed'])
-    return render_template_string(html, records=records, total=len(records), paid=paid, trips=trips)
+    try:
+        records = sheet.get_all_records()
+        html = """
+        <html><head><title>Elite Safari Bot Admin</title>
+        <style>body{font-family:Arial;padding:20px} table{border-collapse:collapse;width:100%}
+        th,td{border:1px solid #ddd;padding:8px;text-align:left} th{background:#FF6B35;color:white}</style>
+        </head><body>
+        <h2>Elite Safari Bot - Live Dashboard</h2>
+        <p>Total Leads: {{total}} | Paid: {{paid}} | Trips This Week: {{trips}}</p>
+        <table><tr><th>Phone</th><th>Trip</th><th>Dates</th><th>Pax</th><th>Status</th><th>Payment</th></tr>
+        {% for r in records %}
+        <tr><td>{{r.phone}}</td><td>{{r.trip_type}}</td><td>{{r.dates}}</td><td>{{r.pax}}</td><td>{{r.trip_status}}</td><td>{{r.payment_status}}</td></tr>
+        {% endfor %}</table></body></html>
+        """
+        paid = len([r for r in records if r.get('payment_status') == 'PAID'])
+        trips = len([r for r in records if r.get('trip_status') == 'Confirmed'])
+        return render_template_string(html, records=records, total=len(records), paid=paid, trips=trips)
+    except Exception as e:
+        print(f"ERROR in admin_dashboard: {e}")
+        return "Error loading dashboard", 500
 
 # ========== WEBHOOK ==========
 @app.route('/webhook', methods=['GET'])
@@ -108,8 +112,15 @@ def webhook():
         if data and 'entry' in data and 'messages' in data['entry'][0]['changes'][0]['value']:
             msg = data['entry'][0]['changes'][0]['value']['messages'][0]
             phone = msg['from']
-            text = msg.get('text', {}).get('body', '').lower()
-            lang = detect(text) if len(text) > 3 else 'en'
+            text = msg.get('text', {}).get('body', '').lower().strip()
+            
+            # FIX: Better language detection with error handling
+            lang = 'en'
+            if len(text) > 3:
+                try:
+                    lang = detect(text)
+                except LangDetectException:
+                    lang = 'en'
 
             if text:
                 handle_message(phone, text, lang)
@@ -121,6 +132,11 @@ def webhook():
 
 # ========== SAFARI FLOWS ==========
 def handle_message(phone, text, lang):
+    # FIX: Validate phone number format
+    if not phone or not isinstance(phone, str):
+        print(f"ERROR: Invalid phone number: {phone}")
+        return
+    
     user_state = get_user_state(phone)
 
     if text in ['hi', 'hello', 'start', 'safari']:
@@ -238,10 +254,13 @@ def send_reminders():
 def paystack_webhook():
     try:
         data = request.json
-        if data['event'] == 'charge.success':
-            phone = data['data']['metadata']['phone']
-            update_sheet(phone, 'payment_status', 'PAID')
-            send_message(phone, "Payment confirmed ✅ Trip confirmed. Check WhatsApp for guide contact.")
+        if data and data.get('event') == 'charge.success':
+            phone = data.get('data', {}).get('metadata', {}).get('phone')
+            if phone:
+                update_sheet(phone, 'payment_status', 'PAID')
+                send_message(phone, "Payment confirmed ✅ Trip confirmed. Check WhatsApp for guide contact.")
+            else:
+                print("ERROR: Missing phone in paystack webhook")
     except Exception as e:
         print(f"ERROR in paystack_webhook: {e}")
     return jsonify({'status': 'success'})
@@ -251,7 +270,9 @@ def send_message(phone, message):
     try:
         url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
         headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-        requests.post(url, headers=headers, json={"messaging_product": "whatsapp", "to": phone, "text": {"body": message}})
+        response = requests.post(url, headers=headers, json={"messaging_product": "whatsapp", "to": phone, "text": {"body": message}}, timeout=10)
+        if response.status_code != 200:
+            print(f"ERROR: WhatsApp API returned {response.status_code}: {response.text}")
     except Exception as e:
         print(f"ERROR sending message to {phone}: {e}")
 
@@ -260,7 +281,9 @@ def send_image(phone, image_url, caption):
         url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
         headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
         data = {"messaging_product": "whatsapp", "to": phone, "type": "image", "image": {"link": image_url, "caption": caption}}
-        requests.post(url, headers=headers, json=data)
+        response = requests.post(url, headers=headers, json=data, timeout=10)
+        if response.status_code != 200:
+            print(f"ERROR: WhatsApp image API returned {response.status_code}: {response.text}")
     except Exception as e:
         print(f"ERROR sending image to {phone}: {e}")
 
@@ -278,14 +301,37 @@ def save_document(phone, media_id, doc_type):
     except Exception as e:
         print(f"ERROR saving document: {e}")
 
+# FIX: Better sheet lookup - find all matches by phone
+def find_user_row(phone):
+    if not sheet:
+        return None
+    try:
+        # Get all records and find matching phone
+        records = sheet.get_all_records()
+        for idx, record in enumerate(records):
+            if record.get('phone') == phone:
+                return idx + 2  # +2 because records start at row 2 (row 1 is header)
+        return None
+    except Exception as e:
+        print(f"ERROR finding user row for {phone}: {e}")
+        return None
+
 def update_sheet(phone, col, val, trip_type=None):
     if not sheet:
         return
     try:
-        cell = sheet.find(phone)
-        sheet.update_cell(cell.row, sheet.find(col).col, val)
-        if trip_type:
-            sheet.update_cell(cell.row, sheet.find('trip_type').col, trip_type)
+        row = find_user_row(phone)
+        if row:
+            col_idx = None
+            headers = sheet.row_values(1)
+            if col in headers:
+                col_idx = headers.index(col) + 1
+                sheet.update_cell(row, col_idx, val)
+            if trip_type and 'trip_type' in headers:
+                trip_col_idx = headers.index('trip_type') + 1
+                sheet.update_cell(row, trip_col_idx, trip_type)
+        else:
+            print(f"ERROR: User {phone} not found in sheet")
     except Exception as e:
         print(f"ERROR updating sheet for {phone}: {e}")
 
@@ -293,7 +339,13 @@ def get_user_state(phone):
     if not sheet:
         return None
     try:
-        return sheet.cell(sheet.find(phone).row, sheet.find('state').col).value
+        row = find_user_row(phone)
+        if row:
+            headers = sheet.row_values(1)
+            if 'state' in headers:
+                state_col = headers.index('state') + 1
+                return sheet.cell(row, state_col).value
+        return None
     except Exception as e:
         print(f"ERROR getting user state for {phone}: {e}")
         return None
@@ -302,14 +354,17 @@ def set_user_state(phone, state):
     if not sheet:
         return
     try:
-        cell = sheet.find(phone)
-        sheet.update_cell(cell.row, sheet.find('state').col, state)
+        row = find_user_row(phone)
+        if row:
+            headers = sheet.row_values(1)
+            if 'state' in headers:
+                state_col = headers.index('state') + 1
+                sheet.update_cell(row, state_col, state)
+        else:
+            # Create new row if user doesn't exist
+            sheet.append_row([datetime.now().isoformat(), phone, '', state])
     except Exception as e:
         print(f"ERROR setting user state for {phone}: {e}")
-        try:
-            sheet.append_row([datetime.now().isoformat(), phone, '', state])
-        except Exception as append_error:
-            print(f"ERROR appending new row: {append_error}")
 
 if __name__ == '__main__':
     app.run(port=5000)
