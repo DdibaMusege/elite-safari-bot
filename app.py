@@ -85,10 +85,10 @@ def admin_dashboard():
         th,td{border:1px solid #ddd;padding:8px;text-align:left} th{background:#FF6B35;color:white}</style>
         </head><body>
         <h2>Elite Safari Bot - Live Dashboard</h2>
-        <p>Total Leads: {{total}} | Paid: {{paid}} | Trips This Week: {{trips}}</p>
+        <p>Total Leads: {{ total }} | Paid: {{ paid }} | Trips This Week: {{ trips }}</p>
         <table><tr><th>Phone</th><th>Trip</th><th>Dates</th><th>Pax</th><th>Status</th><th>Payment</th></tr>
         {% for r in records %}
-        <tr><td>{{r.phone}}</td><td>{{r.trip_type}}</td><td>{{r.dates}}</td><td>{{r.pax}}</td><td>{{r.trip_status}}</td><td>{{r.payment_status}}</td></tr>
+        <tr><td>{{ r.phone }}</td><td>{{ r.trip_type }}</td><td>{{ r.dates }}</td><td>{{ r.pax }}</td><td>{{ r.trip_status }}</td><td>{{ r.payment_status }}</td></tr>
         {% endfor %}</table></body></html>
         """
         paid = len([r for r in records if r.get('payment_status') == 'PAID'])
@@ -109,23 +109,27 @@ def verify():
 def webhook():
     try:
         data = request.get_json()
-        if data and 'entry' in data and 'messages' in data['entry'][0]['changes'][0]['value']:
-            msg = data['entry'][0]['changes'][0]['value']['messages'][0]
-            phone = msg['from']
-            text = msg.get('text', {}).get('body', '').lower().strip()
-            
-            # FIX: Better language detection with error handling
-            lang = 'en'
-            if len(text) > 3:
-                try:
-                    lang = detect(text)
-                except LangDetectException:
-                    lang = 'en'
+        if data and 'entry' in data and len(data['entry']) > 0:
+            if 'changes' in data['entry'][0] and len(data['entry'][0]['changes']) > 0:
+                if 'value' in data['entry'][0]['changes'][0]:
+                    value = data['entry'][0]['changes'][0]['value']
+                    if 'messages' in value and len(value['messages']) > 0:
+                        msg = value['messages'][0]
+                        phone = msg.get('from')
+                        text = msg.get('text', {}).get('body', '').lower().strip() if isinstance(msg.get('text'), dict) else ''
+                        
+                        # FIX: Better language detection with error handling
+                        lang = 'en'
+                        if len(text) > 3:
+                            try:
+                                lang = detect(text)
+                            except LangDetectException:
+                                lang = 'en'
 
-            if text:
-                handle_message(phone, text, lang)
-            if msg.get('type') == 'image':
-                save_document(phone, msg['image']['id'], 'passport')
+                        if text and phone:
+                            handle_message(phone, text, lang)
+                        if msg.get('type') == 'image' and 'image' in msg:
+                            save_document(phone, msg['image'].get('id'), 'passport')
     except Exception as e:
         print(f"ERROR in webhook: {e}")
     return 'OK', 200
@@ -243,8 +247,8 @@ def send_reminders():
                     if days_left in [7, 3, 1]:
                         msg = f"Reminder: {row['trip_type']} in {days_left} day(s) on {trip_date}. Pickup: Entebbe 6:00 AM. Bring passport."
                         send_message(row['phone'], msg)
-                except ValueError:
-                    print(f"Could not parse date: {row['dates']}")
+                except (ValueError, IndexError):
+                    print(f"Could not parse date: {row.get('dates', 'N/A')}")
     except Exception as e:
         print(f"ERROR in send_reminders: {e}")
     return 'Reminders sent', 200
@@ -296,14 +300,14 @@ def notify_admin(message):
 
 def save_document(phone, media_id, doc_type):
     try:
-        if sheet:
+        if sheet and phone and media_id:
             sheet.append_row([datetime.now().isoformat(), phone, doc_type, media_id, get_user_state(phone)])
     except Exception as e:
         print(f"ERROR saving document: {e}")
 
 # FIX: Better sheet lookup - find all matches by phone
 def find_user_row(phone):
-    if not sheet:
+    if not sheet or not phone:
         return None
     try:
         # Get all records and find matching phone
@@ -317,12 +321,11 @@ def find_user_row(phone):
         return None
 
 def update_sheet(phone, col, val, trip_type=None):
-    if not sheet:
+    if not sheet or not phone:
         return
     try:
         row = find_user_row(phone)
         if row:
-            col_idx = None
             headers = sheet.row_values(1)
             if col in headers:
                 col_idx = headers.index(col) + 1
@@ -331,12 +334,14 @@ def update_sheet(phone, col, val, trip_type=None):
                 trip_col_idx = headers.index('trip_type') + 1
                 sheet.update_cell(row, trip_col_idx, trip_type)
         else:
-            print(f"ERROR: User {phone} not found in sheet")
+            print(f"WARNING: User {phone} not found in sheet, creating new entry")
+            # Create new entry if user doesn't exist
+            sheet.append_row([datetime.now().isoformat(), phone, '', '', ''])
     except Exception as e:
         print(f"ERROR updating sheet for {phone}: {e}")
 
 def get_user_state(phone):
-    if not sheet:
+    if not sheet or not phone:
         return None
     try:
         row = find_user_row(phone)
@@ -344,14 +349,15 @@ def get_user_state(phone):
             headers = sheet.row_values(1)
             if 'state' in headers:
                 state_col = headers.index('state') + 1
-                return sheet.cell(row, state_col).value
+                state_value = sheet.cell(row, state_col).value
+                return state_value if state_value else None
         return None
     except Exception as e:
         print(f"ERROR getting user state for {phone}: {e}")
         return None
 
 def set_user_state(phone, state):
-    if not sheet:
+    if not sheet or not phone:
         return
     try:
         row = find_user_row(phone)
