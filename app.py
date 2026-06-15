@@ -16,15 +16,19 @@ PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 PAYSTACK_SECRET = os.getenv("PAYSTACK_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# FIX 1: Initialize OpenAI client safely - check for None
+# FIX: Initialize OpenAI client safely - check for None and handle errors
 client_ai = None
 if OPENAI_API_KEY:
     try:
         client_ai = OpenAI(api_key=OPENAI_API_KEY)
+        print("✅ OpenAI client initialized successfully")
     except Exception as e:
-        print(f"ERROR: Failed to initialize OpenAI client: {e}")
+        print(f"❌ ERROR: Failed to initialize OpenAI client: {e}")
+        print(f"   OPENAI_API_KEY value: {OPENAI_API_KEY[:10]}..." if OPENAI_API_KEY else "   OPENAI_API_KEY is None")
+        client_ai = None
 else:
-    print("WARNING: OPENAI_API_KEY not set. Image generation will be disabled.")
+    print("⚠️  WARNING: OPENAI_API_KEY not set. Image generation will be disabled.")
+    print("   To enable AI image generation, set OPENAI_API_KEY environment variable.")
 
 PAYSTACK_LINKS = {
     "gorilla": "https://paystack.com/pay/safari-gorilla-183k",
@@ -54,18 +58,21 @@ try:
     client = gspread.authorize(creds)
     # FIX: Use worksheet() method instead of sheet1
     sheet = client.open("Elite_Safari_DB").worksheet(0)
+    print("✅ Google Sheets connected successfully")
 except FileNotFoundError:
-    print("WARNING: credentials.json not found. Google Sheets integration disabled.")
+    print("⚠️  WARNING: credentials.json not found. Google Sheets integration disabled.")
 except Exception as e:
-    print(f"ERROR: Failed to connect to Google Sheets: {e}")
+    print(f"❌ ERROR: Failed to connect to Google Sheets: {e}")
 
 # ========== AI IMAGE GENERATOR ==========
 def generate_safari_image(prompt, phone):
     if not client_ai:
+        print("⚠️  Image generation disabled - OpenAI client not initialized")
         send_message(phone, "Image generation is not available. Please try again later.")
         return
     
     try:
+        print(f"🖼️  Generating image with prompt: {prompt}")
         response = client_ai.images.generate(
             model="dall-e-3",
             prompt=f"{prompt}, Uganda safari, professional tourism photo, watermark 'SAMPLE ONLY'",
@@ -74,11 +81,12 @@ def generate_safari_image(prompt, phone):
             n=1
         )
         image_url = response.data[0].url
+        print(f"✅ Image generated successfully: {image_url}")
         send_image(phone, image_url, "Sample photo. Actual lodge may vary.")
         if sheet:
             sheet.append_row([datetime.now().isoformat(), phone, 'ai_image_request', prompt])
     except Exception as e:
-        print(f"ERROR generating image: {e}")
+        print(f"❌ ERROR generating image: {e}")
         send_message(phone, "Sorry, couldn't generate image. Please try again later.")
 
 # ========== ADMIN DASHBOARD ==========
@@ -107,6 +115,19 @@ def admin_dashboard():
     except Exception as e:
         print(f"ERROR in admin_dashboard: {e}")
         return "Error loading dashboard", 500
+
+# ========== HEALTH CHECK ==========
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint for Railway"""
+    status = {
+        "status": "healthy",
+        "whatsapp_configured": bool(WHATSAPP_TOKEN and PHONE_NUMBER_ID),
+        "openai_configured": bool(client_ai is not None),
+        "google_sheets_configured": bool(sheet is not None),
+        "timestamp": datetime.now().isoformat()
+    }
+    return jsonify(status), 200
 
 # ========== WEBHOOK ==========
 @app.route('/webhook', methods=['GET'])
