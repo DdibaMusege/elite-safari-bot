@@ -20,11 +20,12 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 client_ai = None
 if OPENAI_API_KEY:
     try:
+        # Initialize OpenAI with just the API key, no extra parameters
         client_ai = OpenAI(api_key=OPENAI_API_KEY)
         print("✅ OpenAI client initialized successfully")
     except Exception as e:
         print(f"❌ ERROR: Failed to initialize OpenAI client: {e}")
-        print(f"   OPENAI_API_KEY value: {OPENAI_API_KEY[:10]}..." if OPENAI_API_KEY else "   OPENAI_API_KEY is None")
+        print(f"   Error type: {type(e).__name__}")
         client_ai = None
 else:
     print("⚠️  WARNING: OPENAI_API_KEY not set. Image generation will be disabled.")
