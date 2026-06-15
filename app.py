@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify, render_template_string
-import requests, os, datetime
+import requests
+import os
 from datetime import datetime, timedelta
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -13,12 +14,10 @@ VERIFY_TOKEN = "safari_ug_2026"
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 PAYSTACK_SECRET = os.getenv("PAYSTACK_SECRET")
-OPENAI_KEY = os.getenv("OPENAI_KEY")
-import os
-from openai import OpenAI
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 client_ai = OpenAI(
-    api_key=os.getenv("OPENAI_API_KEY")
+    api_key=OPENAI_API_KEY
 )
 
 PAYSTACK_LINKS = {
@@ -42,27 +41,42 @@ BUSINESSES = {
 }
 
 # Google Sheets
-scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
-client = gspread.authorize(creds)
-sheet = client.open("Elite_Safari_DB").sheet1
+try:
+    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+    client = gspread.authorize(creds)
+    sheet = client.open("Elite_Safari_DB").sheet1
+except FileNotFoundError:
+    print("WARNING: credentials.json not found. Google Sheets integration disabled.")
+    sheet = None
+except Exception as e:
+    print(f"ERROR: Failed to connect to Google Sheets: {e}")
+    sheet = None
 
 # ========== AI IMAGE GENERATOR ==========
 def generate_safari_image(prompt, phone):
-    response = client_ai.images.generate(
-        model="dall-e-3",
-        prompt=f"{prompt}, Uganda safari, professional tourism photo, watermark 'SAMPLE ONLY'",
-        size="1024x1024",
-        quality="standard",
-        n=1
-    )
-    image_url = response.data[0].url
-    send_image(phone, image_url, "Sample photo. Actual lodge may vary.")
-    sheet.append_row([datetime.now().isoformat(), phone, 'ai_image_request', prompt])
+    try:
+        response = client_ai.images.generate(
+            model="dall-e-3",
+            prompt=f"{prompt}, Uganda safari, professional tourism photo, watermark 'SAMPLE ONLY'",
+            size="1024x1024",
+            quality="standard",
+            n=1
+        )
+        image_url = response.data[0].url
+        send_image(phone, image_url, "Sample photo. Actual lodge may vary.")
+        if sheet:
+            sheet.append_row([datetime.now().isoformat(), phone, 'ai_image_request', prompt])
+    except Exception as e:
+        print(f"ERROR generating image: {e}")
+        send_message(phone, "Sorry, couldn't generate image. Please try again later.")
 
 # ========== ADMIN DASHBOARD ==========
 @app.route('/admin', methods=['GET'])
 def admin_dashboard():
+    if not sheet:
+        return "Google Sheets not configured", 503
+    
     records = sheet.get_all_records()
     html = """
     <html><head><title>Elite Safari Bot Admin</title>
@@ -89,15 +103,20 @@ def verify():
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    data = request.get_json()
-    if 'messages' in data['entry'][0]['changes'][0]['value']:
-        msg = data['entry'][0]['changes'][0]['value']['messages'][0]
-        phone = msg['from']
-        text = msg.get('text', {}).get('body', '').lower()
-        lang = detect(text) if len(text) > 3 else 'en'
+    try:
+        data = request.get_json()
+        if data and 'entry' in data and 'messages' in data['entry'][0]['changes'][0]['value']:
+            msg = data['entry'][0]['changes'][0]['value']['messages'][0]
+            phone = msg['from']
+            text = msg.get('text', {}).get('body', '').lower()
+            lang = detect(text) if len(text) > 3 else 'en'
 
-        if text: handle_message(phone, text, lang)
-        if msg.get('type') == 'image': save_document(phone, msg['image']['id'], 'passport')
+            if text:
+                handle_message(phone, text, lang)
+            if msg.get('type') == 'image':
+                save_document(phone, msg['image']['id'], 'passport')
+    except Exception as e:
+        print(f"ERROR in webhook: {e}")
     return 'OK', 200
 
 # ========== SAFARI FLOWS ==========
@@ -150,7 +169,7 @@ Reply DONE when sent.""")
             send_message(phone, f"""Gorilla trip details saved ✅
 
 Package: $1,200 per person
-Deposit: $50 / 183,000 UGX holds permits today
+Deposit: $50 USD / 183,000 UGX holds permits today
 Balance: Due 30 days before trip
 
 Pay deposit: {PAYSTACK_LINKS['gorilla']}
@@ -161,14 +180,14 @@ Reply PAID after payment.""")
             send_message(phone, f"""Murchison trip saved ✅
 
 Package: $450 per person
-Deposit: $30 / 110,000 UGX confirms booking
+Deposit: $30 USD / 110,000 UGX confirms booking
 
 Pay deposit: {PAYSTACK_LINKS['murchison']}
 Reply PAID after payment.""")
             set_user_state(phone, 'awaiting_payment_murchison')
 
     elif text == 'paid':
-        if 'gorilla' in user_state:
+        if user_state and 'gorilla' in user_state:
             update_sheet(phone, 'payment_status', 'PAID', 'gorilla trekking 3d2n')
             update_sheet(phone, 'trip_status', 'Confirmed')
             send_message(phone, """Payment confirmed ✅ 183,000 UGX
@@ -180,7 +199,7 @@ He contacts you 3 days before trip.
 Reply CONFIRM when packed. Karibu Uganda!""")
             notify_admin(f"GORILLA BOOKING PAID: {phone}")
 
-        elif 'murchison' in user_state:
+        elif user_state and 'murchison' in user_state:
             update_sheet(phone, 'payment_status', 'PAID', 'murchison falls 2d1n')
             update_sheet(phone, 'trip_status', 'Confirmed')
             send_message(phone, """Payment confirmed ✅ 110,000 UGX
@@ -195,63 +214,102 @@ Pickup: Entebbe/Kampala 6:00 AM""")
 # ========== TRIP REMINDER CRON ==========
 @app.route('/cron/reminders', methods=['GET'])
 def send_reminders():
+    if not sheet:
+        return "Google Sheets not configured", 503
+    
     today = datetime.now().date()
-    for row in sheet.get_all_records():
-        if row.get('dates'):
-            try:
-                trip_date = datetime.strptime(row['dates'].split(',')[0], '%Y-%m-%d').date()
-                days_left = (trip_date - today).days
-                if days_left in [7, 3, 1]:
-                    msg = f"Reminder: {row['trip_type']} in {days_left} day(s) on {trip_date}. Pickup: Entebbe 6:00 AM. Bring passport."
-                    send_message(row['phone'], msg)
-            except: pass
+    try:
+        for row in sheet.get_all_records():
+            if row.get('dates'):
+                try:
+                    trip_date = datetime.strptime(row['dates'].split(',')[0], '%Y-%m-%d').date()
+                    days_left = (trip_date - today).days
+                    if days_left in [7, 3, 1]:
+                        msg = f"Reminder: {row['trip_type']} in {days_left} day(s) on {trip_date}. Pickup: Entebbe 6:00 AM. Bring passport."
+                        send_message(row['phone'], msg)
+                except ValueError:
+                    print(f"Could not parse date: {row['dates']}")
+    except Exception as e:
+        print(f"ERROR in send_reminders: {e}")
     return 'Reminders sent', 200
 
 # ========== PAYSTACK WEBHOOK ==========
 @app.route('/paystack/webhook', methods=['POST'])
 def paystack_webhook():
-    data = request.json
-    if data['event'] == 'charge.success':
-        phone = data['data']['metadata']['phone']
-        update_sheet(phone, 'payment_status', 'PAID')
-        send_message(phone, "Payment confirmed ✅ Trip confirmed. Check WhatsApp for guide contact.")
+    try:
+        data = request.json
+        if data['event'] == 'charge.success':
+            phone = data['data']['metadata']['phone']
+            update_sheet(phone, 'payment_status', 'PAID')
+            send_message(phone, "Payment confirmed ✅ Trip confirmed. Check WhatsApp for guide contact.")
+    except Exception as e:
+        print(f"ERROR in paystack_webhook: {e}")
     return jsonify({'status': 'success'})
 
 # ========== HELPERS ==========
 def send_message(phone, message):
-    url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
-    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-    requests.post(url, headers=headers, json={"messaging_product": "whatsapp", "to": phone, "text": {"body": message}})
+    try:
+        url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
+        headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+        requests.post(url, headers=headers, json={"messaging_product": "whatsapp", "to": phone, "text": {"body": message}})
+    except Exception as e:
+        print(f"ERROR sending message to {phone}: {e}")
 
 def send_image(phone, image_url, caption):
-    url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
-    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
-    data = {"messaging_product": "whatsapp", "to": phone, "type": "image", "image": {"link": image_url, "caption": caption}}
-    requests.post(url, headers=headers, json=data)
+    try:
+        url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
+        headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
+        data = {"messaging_product": "whatsapp", "to": phone, "type": "image", "image": {"link": image_url, "caption": caption}}
+        requests.post(url, headers=headers, json=data)
+    except Exception as e:
+        print(f"ERROR sending image to {phone}: {e}")
 
 def notify_admin(message):
-    admin = BUSINESSES["SAFARI_UG_001"]["admin_phone"]
-    send_message(admin, f"🚨 SAFARI ALERT: {message}")
+    try:
+        admin = BUSINESSES["SAFARI_UG_001"]["admin_phone"]
+        send_message(admin, f"🚨 SAFARI ALERT: {message}")
+    except Exception as e:
+        print(f"ERROR notifying admin: {e}")
 
 def save_document(phone, media_id, doc_type):
-    sheet.append_row([datetime.now().isoformat(), phone, doc_type, media_id, get_user_state(phone)])
+    try:
+        if sheet:
+            sheet.append_row([datetime.now().isoformat(), phone, doc_type, media_id, get_user_state(phone)])
+    except Exception as e:
+        print(f"ERROR saving document: {e}")
 
 def update_sheet(phone, col, val, trip_type=None):
+    if not sheet:
+        return
     try:
         cell = sheet.find(phone)
         sheet.update_cell(cell.row, sheet.find(col).col, val)
-        if trip_type: sheet.update_cell(cell.row, sheet.find('trip_type').col, trip_type)
-    except: pass
+        if trip_type:
+            sheet.update_cell(cell.row, sheet.find('trip_type').col, trip_type)
+    except Exception as e:
+        print(f"ERROR updating sheet for {phone}: {e}")
 
 def get_user_state(phone):
-    try: return sheet.cell(sheet.find(phone).row, sheet.find('state').col).value
-    except: return None
+    if not sheet:
+        return None
+    try:
+        return sheet.cell(sheet.find(phone).row, sheet.find('state').col).value
+    except Exception as e:
+        print(f"ERROR getting user state for {phone}: {e}")
+        return None
 
 def set_user_state(phone, state):
+    if not sheet:
+        return
     try:
         cell = sheet.find(phone)
         sheet.update_cell(cell.row, sheet.find('state').col, state)
-    except: sheet.append_row([datetime.now().isoformat(), phone, '', state])
+    except Exception as e:
+        print(f"ERROR setting user state for {phone}: {e}")
+        try:
+            sheet.append_row([datetime.now().isoformat(), phone, '', state])
+        except Exception as append_error:
+            print(f"ERROR appending new row: {append_error}")
 
 if __name__ == '__main__':
     app.run(port=5000)
