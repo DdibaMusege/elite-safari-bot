@@ -14,7 +14,12 @@ WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 PAYSTACK_SECRET = os.getenv("PAYSTACK_SECRET")
 OPENAI_KEY = os.getenv("OPENAI_KEY")
-client_ai = OpenAI(api_key=OPENAI_KEY)
+import os
+from openai import OpenAI
+
+client_ai = OpenAI(
+    api_key=os.getenv("OPENAI_API_KEY")
+)
 
 PAYSTACK_LINKS = {
     "gorilla": "https://paystack.com/pay/safari-gorilla-183k",
