@@ -16,9 +16,15 @@ PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 PAYSTACK_SECRET = os.getenv("PAYSTACK_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-client_ai = OpenAI(
-    api_key=OPENAI_API_KEY
-)
+# FIX 1: Initialize OpenAI client safely - check for None
+client_ai = None
+if OPENAI_API_KEY:
+    try:
+        client_ai = OpenAI(api_key=OPENAI_API_KEY)
+    except Exception as e:
+        print(f"ERROR: Failed to initialize OpenAI client: {e}")
+else:
+    print("WARNING: OPENAI_API_KEY not set. Image generation will be disabled.")
 
 PAYSTACK_LINKS = {
     "gorilla": "https://paystack.com/pay/safari-gorilla-183k",
@@ -55,6 +61,10 @@ except Exception as e:
 
 # ========== AI IMAGE GENERATOR ==========
 def generate_safari_image(prompt, phone):
+    if not client_ai:
+        send_message(phone, "Image generation is not available. Please try again later.")
+        return
+    
     try:
         response = client_ai.images.generate(
             model="dall-e-3",
@@ -116,6 +126,12 @@ def webhook():
                     if 'messages' in value and len(value['messages']) > 0:
                         msg = value['messages'][0]
                         phone = msg.get('from')
+                        
+                        # FIX 3: Validate phone exists before proceeding
+                        if not phone:
+                            print("ERROR: No phone number in webhook")
+                            return 'OK', 200
+                        
                         text = msg.get('text', {}).get('body', '').lower().strip() if isinstance(msg.get('text'), dict) else ''
                         
                         # FIX: Better language detection with error handling
@@ -176,7 +192,28 @@ Send dates and number of people.
 Includes: Game drive, boat cruise, accommodation, guide.
 Reply DONE when sent.""")
 
-    elif 'show me' in text:
+    # FIX 4: Added missing handlers for options 3 and 4
+    elif user_state == 'awaiting_trip' and text == '3':
+        set_user_state(phone, 'queen_dates')
+        send_message(phone, """Queen Elizabeth 3D/2N 🦓
+
+Send dates and number of people.
+Includes: Game drive, boat cruise, accommodation, guide.
+Reply DONE when sent.""")
+
+    elif user_state == 'awaiting_trip' and text == '4':
+        set_user_state(phone, 'custom_dates')
+        send_message(phone, """Custom 7 Day Safari 🦁
+
+Send me:
+1. Travel dates
+2. Number of people
+3. Your interests (wildlife, hiking, culture, etc)
+
+We'll customize your perfect safari! Reply DONE when sent.""")
+
+    # FIX 5: Made condition more specific to avoid false triggers
+    elif 'show me' in text and ('gorilla' in text or 'bwindi' in text or 'lodge' in text or 'lion' in text):
         if 'gorilla' in text or 'bwindi' in text:
             generate_safari_image("Bwindi Impenetrable Forest gorilla trekking Uganda", phone)
         elif 'lodge' in text:
@@ -206,6 +243,26 @@ Pay deposit: {PAYSTACK_LINKS['murchison']}
 Reply PAID after payment.""")
             set_user_state(phone, 'awaiting_payment_murchison')
 
+        elif user_state == 'queen_dates':
+            send_message(phone, f"""Queen Elizabeth trip saved ✅
+
+Package: $650 per person
+Deposit: $40 USD / 146,000 UGX confirms booking
+
+Pay deposit: {PAYSTACK_LINKS['queen']}
+Reply PAID after payment.""")
+            set_user_state(phone, 'awaiting_payment_queen')
+
+        elif user_state == 'custom_dates':
+            send_message(phone, f"""Custom safari details saved ✅
+
+Package: $2,800 per person (7 days)
+Deposit: $100 USD / 365,000 UGX confirms booking
+
+Pay deposit: {PAYSTACK_LINKS['custom']}
+Reply PAID after payment.""")
+            set_user_state(phone, 'awaiting_payment_custom')
+
     elif text == 'paid':
         if user_state and 'gorilla' in user_state:
             update_sheet(phone, 'payment_status', 'PAID', 'gorilla trekking 3d2n')
@@ -227,6 +284,24 @@ Reply CONFIRM when packed. Karibu Uganda!""")
 Safari confirmed! Guide contacts you 2 days before.
 Pickup: Entebbe/Kampala 6:00 AM""")
 
+        elif user_state and 'queen' in user_state:
+            update_sheet(phone, 'payment_status', 'PAID', 'queen elizabeth 3d2n')
+            update_sheet(phone, 'trip_status', 'Confirmed')
+            send_message(phone, """Payment confirmed ✅ 146,000 UGX
+
+Safari confirmed! Guide contacts you 2 days before.
+Pickup: Entebbe/Kampala 6:00 AM""")
+
+        elif user_state and 'custom' in user_state:
+            update_sheet(phone, 'payment_status', 'PAID', 'custom 7 day')
+            update_sheet(phone, 'trip_status', 'Confirmed')
+            send_message(phone, """Payment confirmed ✅ 365,000 UGX
+
+Custom safari confirmed! Our team will contact you within 24hrs to finalize details.
+Guide contacts you 5 days before trip.
+
+Karibu Uganda!""")
+
     elif text == 'confirm':
         update_sheet(phone, 'trip_status', 'Confirmed')
         send_message(phone, "Confirmed ✅ Guide will meet you at pickup point. Safe travels!")
@@ -242,13 +317,20 @@ def send_reminders():
         for row in sheet.get_all_records():
             if row.get('dates'):
                 try:
-                    trip_date = datetime.strptime(row['dates'].split(',')[0], '%Y-%m-%d').date()
+                    # FIX 6: Better date parsing with safety checks
+                    dates_str = row.get('dates', '')
+                    if not dates_str:
+                        continue
+                    date_parts = dates_str.split(',')
+                    if len(date_parts) == 0:
+                        continue
+                    trip_date = datetime.strptime(date_parts[0].strip(), '%Y-%m-%d').date()
                     days_left = (trip_date - today).days
                     if days_left in [7, 3, 1]:
                         msg = f"Reminder: {row['trip_type']} in {days_left} day(s) on {trip_date}. Pickup: Entebbe 6:00 AM. Bring passport."
                         send_message(row['phone'], msg)
-                except (ValueError, IndexError):
-                    print(f"Could not parse date: {row.get('dates', 'N/A')}")
+                except (ValueError, IndexError, KeyError) as e:
+                    print(f"Could not parse date: {row.get('dates', 'N/A')} - {e}")
     except Exception as e:
         print(f"ERROR in send_reminders: {e}")
     return 'Reminders sent', 200
@@ -271,6 +353,11 @@ def paystack_webhook():
 
 # ========== HELPERS ==========
 def send_message(phone, message):
+    # FIX 7: Validate environment variables before API call
+    if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
+        print(f"ERROR: WhatsApp credentials not configured")
+        return
+    
     try:
         url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
         headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
@@ -281,6 +368,11 @@ def send_message(phone, message):
         print(f"ERROR sending message to {phone}: {e}")
 
 def send_image(phone, image_url, caption):
+    # FIX 7: Validate environment variables before API call
+    if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
+        print(f"ERROR: WhatsApp credentials not configured")
+        return
+    
     try:
         url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
         headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
@@ -372,5 +464,7 @@ def set_user_state(phone, state):
     except Exception as e:
         print(f"ERROR setting user state for {phone}: {e}")
 
+# FIX 8: Use PORT environment variable for Railway deployment
 if __name__ == '__main__':
-    app.run(port=5000)
+    port = int(os.getenv('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
