@@ -57,8 +57,8 @@ try:
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
     client = gspread.authorize(creds)
-    # FIX: Use worksheet() method instead of sheet1
-    sheet = client.open("Elite_Safari_DB").worksheet(0)
+    # FIX: Use get_worksheet(0) to get first worksheet
+    sheet = client.open("Elite_Safari_DB").get_worksheet(0)
     print("✅ Google Sheets connected successfully")
 except FileNotFoundError:
     print("⚠️  WARNING: credentials.json not found. Google Sheets integration disabled.")
@@ -81,7 +81,14 @@ def generate_safari_image(prompt, phone):
             quality="standard",
             n=1
         )
-        image_url = response.data[0].url
+        # response data format may vary; attempt to extract URL safely
+        image_url = None
+        if hasattr(response, 'data') and len(response.data) > 0:
+            image_obj = response.data[0]
+            image_url = getattr(image_obj, 'url', None) or image_obj.get('url') if isinstance(image_obj, dict) else None
+        if not image_url:
+            raise ValueError('No image URL returned from AI')
+
         print(f"✅ Image generated successfully: {image_url}")
         send_image(phone, image_url, "Sample photo. Actual lodge may vary.")
         if sheet:
@@ -134,7 +141,8 @@ def health_check():
 @app.route('/webhook', methods=['GET'])
 def verify():
     if request.args.get('hub.verify_token') == VERIFY_TOKEN:
-        return request.args.get('hub.challenge')
+        challenge = request.args.get('hub.challenge')
+        return challenge or '', 200
     return 'Invalid token', 403
 
 @app.route('/webhook', methods=['POST'])
@@ -383,8 +391,9 @@ def send_message(phone, message):
     try:
         url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
         headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-        response = requests.post(url, headers=headers, json={"messaging_product": "whatsapp", "to": phone, "text": {"body": message}}, timeout=10)
-        if response.status_code != 200:
+        payload = {"messaging_product": "whatsapp", "to": phone, "text": {"body": message}}
+        response = requests.post(url, headers=headers, json=payload, timeout=10)
+        if response.status_code not in (200, 201):
             print(f"ERROR: WhatsApp API returned {response.status_code}: {response.text}")
     except Exception as e:
         print(f"ERROR sending message to {phone}: {e}")
@@ -397,10 +406,10 @@ def send_image(phone, image_url, caption):
     
     try:
         url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
-        headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
+        headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
         data = {"messaging_product": "whatsapp", "to": phone, "type": "image", "image": {"link": image_url, "caption": caption}}
         response = requests.post(url, headers=headers, json=data, timeout=10)
-        if response.status_code != 200:
+        if response.status_code not in (200, 201):
             print(f"ERROR: WhatsApp image API returned {response.status_code}: {response.text}")
     except Exception as e:
         print(f"ERROR sending image to {phone}: {e}")
@@ -450,7 +459,19 @@ def update_sheet(phone, col, val, trip_type=None):
         else:
             print(f"WARNING: User {phone} not found in sheet, creating new entry")
             # Create new entry if user doesn't exist
-            sheet.append_row([datetime.now().isoformat(), phone, '', '', ''])
+            # Attempt to match header length if possible
+            try:
+                headers = sheet.row_values(1)
+                empty_row = [''] * len(headers)
+                # fill phone in the appropriate column if available
+                if 'phone' in headers:
+                    empty_row[headers.index('phone')] = phone
+                if 'created_at' in headers:
+                    empty_row[headers.index('created_at')] = datetime.now().isoformat()
+                sheet.append_row(empty_row)
+            except Exception:
+                # fallback minimal row
+                sheet.append_row([datetime.now().isoformat(), phone, '', '', ''])
     except Exception as e:
         print(f"ERROR updating sheet for {phone}: {e}")
 
@@ -482,7 +503,18 @@ def set_user_state(phone, state):
                 sheet.update_cell(row, state_col, state)
         else:
             # Create new row if user doesn't exist
-            sheet.append_row([datetime.now().isoformat(), phone, '', state])
+            try:
+                headers = sheet.row_values(1)
+                empty_row = [''] * len(headers)
+                if 'phone' in headers:
+                    empty_row[headers.index('phone')] = phone
+                if 'state' in headers:
+                    empty_row[headers.index('state')] = state
+                if 'created_at' in headers:
+                    empty_row[headers.index('created_at')] = datetime.now().isoformat()
+                sheet.append_row(empty_row)
+            except Exception:
+                sheet.append_row([datetime.now().isoformat(), phone, '', state])
     except Exception as e:
         print(f"ERROR setting user state for {phone}: {e}")
 
