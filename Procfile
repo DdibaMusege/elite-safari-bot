@@ -1,1 +1,1 @@
-web: gunicorn app:app
+web: bash -lc 'if [ -n "$GOOGLE_CREDENTIALS" ]; then echo "$GOOGLE_CREDENTIALS" > credentials.json; fi && exec gunicorn app:app --bind 0.0.0.0:$PORT --workers 1'
